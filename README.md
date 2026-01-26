@@ -32,9 +32,14 @@ chmod +x ~/.local/bin/claude-usage
 ```bash
 rustup target add wasm32-wasip1
 cargo build --release
-cp target/wasm32-wasip1/release/zellij_claude_bar.wasm ~/.config/zellij/plugins/
+cp target/wasm32-wasip1/release/zellij-claude-bar.wasm ~/.config/zellij/plugins/zellij_claude_bar.wasm
 cp bin/claude-usage ~/.local/bin/
 ```
+
+> **Note**: If you have Homebrew Rust installed alongside rustup, you may need to explicitly use rustup's toolchain:
+> ```bash
+> RUSTC=~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc ~/.cargo/bin/cargo build --release
+> ```
 
 ### Set Up Cron
 
@@ -56,7 +61,9 @@ layout {
             plugin location="zellij:tab-bar"
         }
         pane size=1 borderless=true {
-            plugin location="file:~/.config/zellij/plugins/zellij_claude_bar.wasm"
+            plugin location="file:~/.config/zellij/plugins/zellij_claude_bar.wasm" {
+                data_file "/home/YOUR_USERNAME/.local/state/claude-usage/usage.json"
+            }
         }
         children
         pane size=1 borderless=true {
@@ -67,25 +74,27 @@ layout {
 }
 ```
 
-## Configuration
+> **Important**: You must specify `data_file` with an absolute path. WASM plugins cannot access environment variables like `$HOME`.
 
-All options are optional with smart defaults:
+On first launch, Zellij will prompt you to grant the `RunCommands` permission. Focus the plugin pane and press `y` to allow it to read the usage data file.
+
+## Configuration
 
 ```kdl
 plugin location="file:~/.config/zellij/plugins/zellij_claude_bar.wasm" {
+    data_file "/home/user/.local/state/claude-usage/usage.json"  // REQUIRED: absolute path
     clock "auto"        // "auto" | "12h" | "24h" | "off"
     suffix "short"      // "short" (a/p) | "long" (AM/PM) | "none"
     date_format "auto"  // "auto" | "us" | "intl" | "iso"
-    data_file "/custom/path/to/usage.json"  // default: auto-detected
 }
 ```
 
 | Option | Values | Default | Description |
 |--------|--------|---------|-------------|
+| `data_file` | absolute path | - | **Required.** Path to usage JSON file |
 | `clock` | auto/12h/24h/off | auto | Clock format (auto detects from locale) |
 | `suffix` | short/long/none | short | AM/PM style for 12h mode |
 | `date_format` | auto/us/intl/iso | auto | Date ordering |
-| `data_file` | path | auto | Path to usage JSON |
 
 ## Display Modes
 
@@ -106,14 +115,29 @@ The `claude-usage` script fetches usage from the Anthropic API:
 # Run manually
 claude-usage -v
 
-# Output location (default)
-~/.local/state/claude-usage/usage.json
+# Output locations (default)
+~/.local/state/claude-usage/usage.json      # Current state (plugin reads this)
+~/.local/state/claude-usage/history.jsonl   # Append-only history log
 ```
 
 Features:
 - Uses OAuth token from `~/.claude/.credentials.json`
 - Falls back gracefully: `jq` → `grep/sed`, `curl` → `wget`
 - Works on macOS and Linux
+- Appends each fetch to history log (JSONL format) for later analysis
+
+### Analyzing History
+
+```bash
+# Count entries
+wc -l ~/.local/state/claude-usage/history.jsonl
+
+# View as JSON array
+cat ~/.local/state/claude-usage/history.jsonl | jq -s '.'
+
+# Extract utilization over time (TSV)
+cat ~/.local/state/claude-usage/history.jsonl | jq -r '[.fetched_at, .five_hour.utilization, .seven_day.utilization] | @tsv'
+```
 
 ## Requirements
 

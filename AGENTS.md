@@ -38,13 +38,19 @@ A POSIX shell script that:
 - Fetches usage from `https://api.anthropic.com/api/oauth/usage`
 - Uses OAuth token from Claude credentials file
 - Writes JSON to `$XDG_STATE_HOME/claude-usage/usage.json`
+- Appends to history log at `$XDG_STATE_HOME/claude-usage/history.jsonl`
 
 **Features:**
 - Credential discovery: `$CLAUDE_CONFIG_DIR` → `$XDG_CONFIG_HOME/claude` → `$HOME/.claude`
 - Tool fallbacks: `jq` → `grep/sed`, `curl` → `wget`
 - POSIX-compatible (works on macOS and Linux)
+- History logging: each fetch appends a compact JSON line for later analysis
 
-**Output format:**
+**Output files:**
+- `usage.json` - Current state (pretty-printed, plugin reads this)
+- `history.jsonl` - Append-only log (one JSON object per line)
+
+**JSON format:**
 ```json
 {
   "fetched_at": "2026-01-26T04:24:42Z",
@@ -59,7 +65,7 @@ A POSIX shell script that:
 }
 ```
 
-### Plugin: `src/lib.rs`
+### Plugin: `src/main.rs`
 
 Implements `ZellijPlugin` trait:
 - `load()`: Request permissions, subscribe to events, start timer
@@ -112,7 +118,7 @@ All options can be set in the Zellij layout plugin config:
 
 ```kdl
 plugin location="file:/path/to/zellij_claude_bar.wasm" {
-    data_file "/custom/path/to/usage.json"  // default: auto-detected
+    data_file "/home/user/.local/state/claude-usage/usage.json"  // REQUIRED: absolute path
     clock "auto"      // "auto" | "12h" | "24h" | "off"
     suffix "short"    // "short" (a/p) | "long" (AM/PM) | "none"
     date_format "auto"  // "auto" | "us" | "intl" | "iso"
@@ -121,7 +127,7 @@ plugin location="file:/path/to/zellij_claude_bar.wasm" {
 
 | Option | Values | Default | Description |
 |--------|--------|---------|-------------|
-| `data_file` | path | XDG/home detection | Path to usage JSON file |
+| `data_file` | absolute path | - | **Required.** WASM plugins cannot access env vars |
 | `clock` | auto/12h/24h/off | auto | Clock format (auto detects from locale) |
 | `suffix` | short/long/none | short | AM/PM style: "a/p", "AM/PM", or none |
 | `date_format` | auto/us/intl/iso | auto | Date ordering (auto detects from locale) |
@@ -169,6 +175,9 @@ rustup target add wasm32-wasip1
 
 # Build
 cargo build --release
+
+# If you have Homebrew Rust alongside rustup, use:
+RUSTC=~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc ~/.cargo/bin/cargo build --release
 ```
 
 ### 4. Configure Zellij
@@ -176,15 +185,19 @@ cargo build --release
 Add to your Zellij layout:
 ```kdl
 pane size=1 borderless=true {
-    plugin location="file:/path/to/target/wasm32-wasip1/release/zellij_claude_bar.wasm"
+    plugin location="file:~/.config/zellij/plugins/zellij_claude_bar.wasm" {
+        data_file "/home/YOUR_USER/.local/state/claude-usage/usage.json"
+    }
 }
 ```
 
+On first launch, grant the `RunCommands` permission when prompted.
+
 ## Development Workflow
 
-1. Edit source in `src/lib.rs`
+1. Edit source in `src/main.rs`
 2. Build: `cargo build`
-3. Test: `zellij action start-or-reload-plugin file:target/wasm32-wasip1/debug/zellij_claude_bar.wasm`
+3. Test: `zellij action start-or-reload-plugin file:target/wasm32-wasip1/debug/zellij-claude-bar.wasm`
 
 ## File Structure
 
@@ -195,7 +208,7 @@ zellij-claude-bar/
 ├── bin/
 │   └── claude-usage     # CLI tool to fetch usage data
 ├── src/
-│   └── lib.rs           # Zellij plugin
+│   └── main.rs          # Zellij plugin (binary crate for _start export)
 ├── Cargo.toml           # Rust dependencies
 ├── README.md            # User documentation
 ├── CLAUDE.md            # Points to AGENTS.md

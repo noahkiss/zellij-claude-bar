@@ -410,9 +410,8 @@ impl ClaudeBar {
 
     /// Request to read the usage data file
     fn request_data_refresh(&self) {
-        let cmd = vec!["cat".to_string(), self.data_file.clone()];
         let ctx = BTreeMap::from([("source".to_string(), "usage_read".to_string())]);
-        run_command(&cmd, ctx);
+        run_command(&["cat", &self.data_file], ctx);
     }
 
     /// Build usage display string and its visible length
@@ -636,7 +635,7 @@ impl ZellijPlugin for ClaudeBar {
             }
 
             Event::ModeUpdate(mode_info) => {
-                self.palette = Some(mode_info.style.colors);
+                self.palette = Some(mode_info.style.colors.into());
                 true
             }
 

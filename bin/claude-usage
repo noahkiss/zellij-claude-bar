@@ -1,0 +1,273 @@
+#!/bin/sh
+# claude-usage - Fetch Claude API usage data and write to JSON file
+# Designed to be run via cron every 5 minutes
+#
+# Dependencies (with fallbacks):
+#   - curl OR wget
+#   - jq OR grep/sed (POSIX-compatible)
+#
+# Output: JSON file with utilization data for zellij-claude-bar plugin
+
+set -e
+
+# --- Configuration ---
+
+# Where to write output (plugin reads this)
+get_output_path() {
+    if [ -n "$CLAUDE_USAGE_OUTPUT" ]; then
+        echo "$CLAUDE_USAGE_OUTPUT"
+    elif [ -n "$XDG_STATE_HOME" ]; then
+        echo "$XDG_STATE_HOME/claude-usage/usage.json"
+    else
+        echo "$HOME/.local/state/claude-usage/usage.json"
+    fi
+}
+
+# Where to find Claude credentials
+get_credentials_path() {
+    local paths=""
+
+    # Check in order of precedence
+    if [ -n "$CLAUDE_CONFIG_DIR" ] && [ -f "$CLAUDE_CONFIG_DIR/.credentials.json" ]; then
+        echo "$CLAUDE_CONFIG_DIR/.credentials.json"
+        return 0
+    fi
+
+    if [ -n "$XDG_CONFIG_HOME" ] && [ -f "$XDG_CONFIG_HOME/claude/.credentials.json" ]; then
+        echo "$XDG_CONFIG_HOME/claude/.credentials.json"
+        return 0
+    fi
+
+    if [ -f "$HOME/.claude/.credentials.json" ]; then
+        echo "$HOME/.claude/.credentials.json"
+        return 0
+    fi
+
+    return 1
+}
+
+# --- Tool Detection ---
+
+HAS_JQ=false
+HAS_CURL=false
+HAS_WGET=false
+
+command -v jq >/dev/null 2>&1 && HAS_JQ=true
+command -v curl >/dev/null 2>&1 && HAS_CURL=true
+command -v wget >/dev/null 2>&1 && HAS_WGET=true
+
+# --- JSON Parsing (with fallback) ---
+
+# Extract a simple string/number value from JSON
+# Usage: json_extract "$json" "key"
+# Handles nested access like "five_hour.utilization"
+json_extract() {
+    local json="$1"
+    local key="$2"
+
+    if $HAS_JQ; then
+        echo "$json" | jq -r ".$key // empty" 2>/dev/null
+        return
+    fi
+
+    # Fallback: grep/sed parsing (works for flat or simple nested JSON)
+    # This is fragile but handles the specific API response format
+    local value=""
+
+    case "$key" in
+        five_hour.utilization)
+            # Match: "five_hour": { ... "utilization": 45.2 ... }
+            value=$(echo "$json" | tr -d '\n' | sed 's/.*"five_hour"[^{]*{[^}]*"utilization"[[:space:]]*:[[:space:]]*\([0-9.]*\).*/\1/')
+            ;;
+        five_hour.resets_at)
+            value=$(echo "$json" | tr -d '\n' | sed 's/.*"five_hour"[^{]*{[^}]*"resets_at"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+            ;;
+        seven_day.utilization)
+            value=$(echo "$json" | tr -d '\n' | sed 's/.*"seven_day"[^{]*{[^}]*"utilization"[[:space:]]*:[[:space:]]*\([0-9.]*\).*/\1/')
+            ;;
+        seven_day.resets_at)
+            value=$(echo "$json" | tr -d '\n' | sed 's/.*"seven_day"[^{]*{[^}]*"resets_at"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+            ;;
+        claudeAiOauth.accessToken)
+            value=$(echo "$json" | tr -d '\n' | sed 's/.*"accessToken"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+            ;;
+    esac
+
+    # Validate we got something that looks right (not the whole input)
+    if [ -n "$value" ] && [ "$value" != "$json" ] && [ ${#value} -lt 500 ]; then
+        echo "$value"
+    fi
+}
+
+# --- HTTP Request (with fallback) ---
+
+# Make HTTP GET request with headers
+# Usage: http_get "$url" "$auth_header"
+http_get() {
+    local url="$1"
+    local token="$2"
+
+    if $HAS_CURL; then
+        curl -s "$url" \
+            -H "Authorization: Bearer $token" \
+            -H "anthropic-beta: oauth-2025-04-20" \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: claude-usage/1.0"
+        return
+    fi
+
+    if $HAS_WGET; then
+        wget -q -O - "$url" \
+            --header="Authorization: Bearer $token" \
+            --header="anthropic-beta: oauth-2025-04-20" \
+            --header="Content-Type: application/json" \
+            --header="User-Agent: claude-usage/1.0"
+        return
+    fi
+
+    echo "Error: Neither curl nor wget found" >&2
+    return 1
+}
+
+# --- Main ---
+
+main() {
+    local verbose=false
+    [ "$1" = "-v" ] || [ "$1" = "--verbose" ] && verbose=true
+
+    # Find credentials
+    local creds_path
+    creds_path=$(get_credentials_path) || {
+        $verbose && echo "Error: No Claude credentials found" >&2
+        $verbose && echo "Searched:" >&2
+        $verbose && echo "  \$CLAUDE_CONFIG_DIR/.credentials.json" >&2
+        $verbose && echo "  \$XDG_CONFIG_HOME/claude/.credentials.json" >&2
+        $verbose && echo "  \$HOME/.claude/.credentials.json" >&2
+        exit 1
+    }
+
+    $verbose && echo "Using credentials: $creds_path" >&2
+
+    # Extract token
+    local creds_json
+    creds_json=$(cat "$creds_path" 2>/dev/null) || {
+        echo "Error: Cannot read credentials file" >&2
+        exit 1
+    }
+
+    local token
+    token=$(json_extract "$creds_json" "claudeAiOauth.accessToken")
+
+    if [ -z "$token" ]; then
+        $verbose && echo "Error: No OAuth token found in credentials" >&2
+        exit 1
+    fi
+
+    $verbose && echo "Token found (${#token} chars)" >&2
+
+    # Check for HTTP client
+    if ! $HAS_CURL && ! $HAS_WGET; then
+        echo "Error: Neither curl nor wget is installed" >&2
+        exit 1
+    fi
+
+    # Fetch usage data
+    $verbose && echo "Fetching usage data..." >&2
+
+    local response
+    response=$(http_get "https://api.anthropic.com/api/oauth/usage" "$token") || {
+        echo "Error: HTTP request failed" >&2
+        exit 1
+    }
+
+    # Parse response
+    local five_hour_util five_hour_reset seven_day_util seven_day_reset
+    five_hour_util=$(json_extract "$response" "five_hour.utilization")
+    five_hour_reset=$(json_extract "$response" "five_hour.resets_at")
+    seven_day_util=$(json_extract "$response" "seven_day.utilization")
+    seven_day_reset=$(json_extract "$response" "seven_day.resets_at")
+
+    # Validate we got data
+    if [ -z "$five_hour_util" ] && [ -z "$seven_day_util" ]; then
+        $verbose && echo "Error: Could not parse usage data from response" >&2
+        $verbose && echo "Response: $response" >&2
+        exit 1
+    fi
+
+    # Default to 0 if missing
+    : "${five_hour_util:=0}"
+    : "${seven_day_util:=0}"
+    : "${five_hour_reset:=null}"
+    : "${seven_day_reset:=null}"
+
+    # Get current timestamp
+    local now
+    now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    # Build output JSON
+    local output
+    if $HAS_JQ; then
+        # Use jq for proper JSON formatting
+        output=$(jq -n \
+            --arg ts "$now" \
+            --argjson fh_util "$five_hour_util" \
+            --arg fh_reset "$five_hour_reset" \
+            --argjson sd_util "$seven_day_util" \
+            --arg sd_reset "$seven_day_reset" \
+            '{
+                fetched_at: $ts,
+                five_hour: {
+                    utilization: $fh_util,
+                    resets_at: $fh_reset
+                },
+                seven_day: {
+                    utilization: $sd_util,
+                    resets_at: $sd_reset
+                }
+            }')
+    else
+        # Manual JSON construction
+        output=$(cat <<EOF
+{
+  "fetched_at": "$now",
+  "five_hour": {
+    "utilization": $five_hour_util,
+    "resets_at": "$five_hour_reset"
+  },
+  "seven_day": {
+    "utilization": $seven_day_util,
+    "resets_at": "$seven_day_reset"
+  }
+}
+EOF
+)
+    fi
+
+    # Determine output path
+    local output_path
+    output_path=$(get_output_path)
+
+    # Create output directory if needed
+    local output_dir
+    output_dir=$(dirname "$output_path")
+    if [ ! -d "$output_dir" ]; then
+        mkdir -p "$output_dir" || {
+            echo "Error: Cannot create output directory: $output_dir" >&2
+            exit 1
+        }
+    fi
+
+    # Write output
+    echo "$output" > "$output_path" || {
+        echo "Error: Cannot write to $output_path" >&2
+        exit 1
+    }
+
+    $verbose && echo "Written to: $output_path" >&2
+    $verbose && echo "$output" >&2
+
+    # Also print to stdout for piping
+    echo "$output"
+}
+
+main "$@"

@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          cp target/wasm32-wasip1/release/zellij_claude_bar.wasm release/
+          cp bin/claude-usage release/
+          chmod +x release/claude-usage
+
+      - name: Create release archive
+        run: |
+          cd release
+          tar -czvf ../zellij-claude-bar-${{ github.ref_name }}.tar.gz *
+          cd ..
+          # Also keep individual files for direct download
+          cp release/zellij_claude_bar.wasm zellij_claude_bar.wasm
+          cp release/claude-usage claude-usage
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            zellij-claude-bar-${{ github.ref_name }}.tar.gz
+            zellij_claude_bar.wasm
+            claude-usage
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

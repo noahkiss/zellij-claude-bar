@@ -3,96 +3,182 @@
 ## Project Overview
 
 A Zellij plugin (WASM) written in Rust that displays a single-line status bar with:
-1. Current time (clock)
-2. Claude API 5-hour rate limit usage and projection
-3. Claude API 7-day rate limit usage and projection
-4. Color-coded status indicators based on limit projection
+1. Claude API usage (5-hour and 7-day rate limits)
+2. Pace indicators (on track / running hot / underutilizing)
+3. Time until reset
+4. Clock with date (right-aligned)
 
 ## Architecture
 
-### Plugin Lifecycle
+### Components
 
-Zellij plugins implement the `ZellijPlugin` trait from `zellij-tile`:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        User's System                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌──────────────┐     cron      ┌─────────────────────────┐     │
+│  │ claude-usage │ ──(5 min)───► │ ~/.local/state/         │     │
+│  │ (shell CLI)  │               │ claude-usage/usage.json │     │
+│  └──────────────┘               └───────────┬─────────────┘     │
+│         │                                   │                    │
+│         │ fetches                           │ reads              │
+│         ▼                                   ▼                    │
+│  ┌──────────────────┐              ┌────────────────────┐       │
+│  │ Anthropic API    │              │ Zellij Plugin      │       │
+│  │ /api/oauth/usage │              │ (WASM)             │       │
+│  └──────────────────┘              └────────────────────┘       │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-- `load()`: Called once on plugin initialization. Subscribe to events, request permissions, set up timers.
-- `update(event)`: Called when subscribed events occur. Return `true` to trigger re-render.
-- `render(rows, cols)`: Called to draw the UI. Print to STDOUT with ANSI codes.
+### CLI Tool: `bin/claude-usage`
 
-### Key Dependencies
+A POSIX shell script that:
+- Fetches usage from `https://api.anthropic.com/api/oauth/usage`
+- Uses OAuth token from Claude credentials file
+- Writes JSON to `$XDG_STATE_HOME/claude-usage/usage.json`
 
-- `zellij-tile` (0.43+): The official Zellij plugin SDK
-- `chrono`: Time handling and formatting
-- `serde/serde_json`: JSON parsing for limits data
+**Features:**
+- Credential discovery: `$CLAUDE_CONFIG_DIR` → `$XDG_CONFIG_HOME/claude` → `$HOME/.claude`
+- Tool fallbacks: `jq` → `grep/sed`, `curl` → `wget`
+- POSIX-compatible (works on macOS and Linux)
 
-### Build Target
+**Output format:**
+```json
+{
+  "fetched_at": "2026-01-26T04:24:42Z",
+  "five_hour": {
+    "utilization": 55.0,
+    "resets_at": "2026-01-26T06:59:59.819279+00:00"
+  },
+  "seven_day": {
+    "utilization": 71.0,
+    "resets_at": "2026-01-29T15:59:59.819305+00:00"
+  }
+}
+```
 
-The plugin compiles to `wasm32-wasip1` (WebAssembly). Configuration in `.cargo/config.toml`.
+### Plugin: `src/lib.rs`
 
-## Theme Colors
+Implements `ZellijPlugin` trait:
+- `load()`: Request permissions, subscribe to events, start timer
+- `update()`: Handle timer, mode updates, command results
+- `render()`: Draw status bar with responsive layout
 
-Zellij provides theme-aware colors through the `Palette` struct (received via `ModeUpdate` event):
+**Permissions needed:**
+- `ReadApplicationState`: Access theme palette
+- `RunCommands`: Read JSON file via `cat`
 
-| Color | Use Case |
-|-------|----------|
-| `green` | On track - will hit limit close to reset |
-| `orange` / `yellow` | Running hot - will hit limit before reset |
-| `red` | Underutilizing - won't hit limit (wasted capacity) |
+**Events used:**
+- `Timer`: Periodic refresh (60s)
+- `ModeUpdate`: Theme palette updates
+- `RunCommandResult`: JSON file read results
 
-For colored text rendering, use `color_range(index, range)` on `Text` elements:
-- Index 0: foreground
-- Index 1: green
-- Index 2: orange/yellow
-- Index 3: red
-
-## Responsive Layout
+## Display Modes
 
 The plugin adapts to terminal width:
 
-| Width | Display |
-|-------|---------|
-| < 20 | Clock only |
-| 20-29 | Clock + minimal limits |
-| 30-49 | Clock + usage ratios |
-| 50-79 | Clock + labeled usage |
-| 80+ | Full display with reset times |
+| Width | Mode | Usage Display | Clock Display |
+|-------|------|---------------|---------------|
+| < 6 | hidden | -- | -- |
+| 6-17 | hidden | -- | `10:43` |
+| 18-29 | minimal | `5h:45% 7d:12%` | `10:43a` |
+| 30-44 | compact | `5h ████░░ 7d ██░░░░` | `10:43 AM` |
+| 45-69 | medium | `5h: 45% (2h30m) │ 7d: 12% (4d)` | `10:43 AM 1/27` |
+| 70+ | full | `5h: 45% (50% elapsed) 2h30m │ ...` | `10:43 AM Wed, Jan 27` |
 
-## Open Questions / TODOs
+**Layout:** Usage left-aligned, clock right-aligned, space-padded between.
 
-### Limit Data Source
+## Color Coding (Pace Status)
 
-The Claude API doesn't have a public endpoint for checking current usage. Options:
+Colors indicate whether usage pace is sustainable:
 
-1. **Local file tracking**: Write usage to a JSON file that the plugin reads
-2. **API header parsing**: Extract rate limit headers from Claude API responses
-3. **External service**: Build a small service that tracks usage
-4. **Manual configuration**: User updates limits file manually
+| Status | Color | Meaning |
+|--------|-------|---------|
+| On Track | Green | Utilization ≈ elapsed time (±15%) |
+| Running Hot | Yellow | Utilization > elapsed - will exhaust early |
+| Underutilizing | Red | Utilization < elapsed - wasting capacity |
+| Unknown | White | No data or invalid timestamps |
 
-Current implementation uses a placeholder. The `limits_file` config option is stubbed.
+**Calculation:** `ratio = utilization% / period_elapsed%`
+- ratio 0.85-1.15 → On Track
+- ratio > 1.15 → Running Hot
+- ratio < 0.85 → Underutilizing
 
-### Enhanced Color Rendering
+## Configuration Options
 
-The current implementation prints plain text. For proper theme-colored output:
+All options can be set in the Zellij layout plugin config:
 
-```rust
-use zellij_tile::prelude::*;
-
-// In render():
-let text = Text::new("OK")
-    .color_range(1, 0..2); // Color with green (index 1)
-print_text_with_coordinates(text, x, y, None, None);
+```kdl
+plugin location="file:/path/to/zellij_claude_bar.wasm" {
+    data_file "/custom/path/to/usage.json"  // default: auto-detected
+    clock "auto"      // "auto" | "12h" | "24h" | "off"
+    suffix "short"    // "short" (a/p) | "long" (AM/PM) | "none"
+    date_format "auto"  // "auto" | "us" | "intl" | "iso"
+}
 ```
 
-### Events Used
+| Option | Values | Default | Description |
+|--------|--------|---------|-------------|
+| `data_file` | path | XDG/home detection | Path to usage JSON file |
+| `clock` | auto/12h/24h/off | auto | Clock format (auto detects from locale) |
+| `suffix` | short/long/none | short | AM/PM style: "a/p", "AM/PM", or none |
+| `date_format` | auto/us/intl/iso | auto | Date ordering (auto detects from locale) |
 
-- `Timer`: Periodic updates (every 30 seconds)
-- `ModeUpdate`: Receive theme palette
-- `PermissionRequestResult`: Check web access permission
-- `WebRequestResult`: Handle API responses
+## Locale Detection
 
-### Permissions Needed
+When set to "auto", the plugin checks `LC_TIME`, `LC_ALL`, or `LANG`:
 
-- `ReadApplicationState`: Access mode/theme info
-- `WebAccess`: Make HTTP requests (if fetching from API)
+**Clock format:**
+- 12-hour: `en_US`, `en_AU`, `en_CA`, `en_NZ`, `en_PH`, `es_US`, `es_MX`
+- 24-hour: All other locales
+
+**Date format:**
+- US (MM/DD, "Jan 27"): `en_US*`
+- International (DD/MM, "27 Jan"): All other locales
+- ISO option: `2026-01-27` (year-month-day)
+
+## Installation
+
+### 1. Install the CLI tool
+
+```bash
+# Copy to PATH
+cp bin/claude-usage ~/.local/bin/
+chmod +x ~/.local/bin/claude-usage
+
+# Test it
+claude-usage -v
+```
+
+### 2. Set up cron
+
+```bash
+# Run every 5 minutes
+crontab -e
+*/5 * * * * ~/.local/bin/claude-usage >/dev/null 2>&1
+```
+
+### 3. Build the plugin
+
+```bash
+# Install Rust if needed
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup target add wasm32-wasip1
+
+# Build
+cargo build --release
+```
+
+### 4. Configure Zellij
+
+Add to your Zellij layout:
+```kdl
+pane size=1 borderless=true {
+    plugin location="file:/path/to/target/wasm32-wasip1/release/zellij_claude_bar.wasm"
+}
+```
 
 ## Development Workflow
 
@@ -100,18 +186,24 @@ print_text_with_coordinates(text, x, y, None, None);
 2. Build: `cargo build`
 3. Test: `zellij action start-or-reload-plugin file:target/wasm32-wasip1/debug/zellij_claude_bar.wasm`
 
-Or use the Zellij development layout pattern for hot-reloading.
-
 ## File Structure
 
 ```
 zellij-claude-bar/
 ├── .cargo/
 │   └── config.toml      # WASM build target config
+├── bin/
+│   └── claude-usage     # CLI tool to fetch usage data
 ├── src/
-│   └── lib.rs           # Main plugin code
-├── Cargo.toml           # Dependencies
+│   └── lib.rs           # Zellij plugin
+├── Cargo.toml           # Rust dependencies
 ├── README.md            # User documentation
 ├── CLAUDE.md            # Points to AGENTS.md
-└── AGENTS.md            # This file - dev context
+└── AGENTS.md            # This file
 ```
+
+## Key Dependencies
+
+- `zellij-tile` 0.43+: Zellij plugin SDK
+- `chrono` 0.4: Time/date handling (with `clock` feature for Local timezone)
+- `serde` + `serde_json`: JSON parsing

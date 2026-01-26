@@ -6,7 +6,9 @@
 #   - curl OR wget
 #   - jq OR grep/sed (POSIX-compatible)
 #
-# Output: JSON file with utilization data for zellij-claude-bar plugin
+# Output:
+#   - JSON file with utilization data for zellij-claude-bar plugin
+#   - History log (JSONL) for later analysis
 
 set -e
 
@@ -20,6 +22,17 @@ get_output_path() {
         echo "$XDG_STATE_HOME/claude-usage/usage.json"
     else
         echo "$HOME/.local/state/claude-usage/usage.json"
+    fi
+}
+
+# Where to write history log (JSONL format - one JSON object per line)
+get_history_path() {
+    if [ -n "$CLAUDE_USAGE_HISTORY" ]; then
+        echo "$CLAUDE_USAGE_HISTORY"
+    elif [ -n "$XDG_STATE_HOME" ]; then
+        echo "$XDG_STATE_HOME/claude-usage/history.jsonl"
+    else
+        echo "$HOME/.local/state/claude-usage/history.jsonl"
     fi
 }
 
@@ -265,6 +278,30 @@ EOF
 
     $verbose && echo "Written to: $output_path" >&2
     $verbose && echo "$output" >&2
+
+    # Append to history log (JSONL format - one compact JSON per line)
+    local history_path
+    history_path=$(get_history_path)
+
+    local history_dir
+    history_dir=$(dirname "$history_path")
+    if [ ! -d "$history_dir" ]; then
+        mkdir -p "$history_dir" 2>/dev/null || true
+    fi
+
+    # Create compact single-line JSON for history
+    local history_line
+    if $HAS_JQ; then
+        history_line=$(echo "$output" | jq -c .)
+    else
+        # Manual single-line: remove newlines and excess whitespace
+        history_line=$(echo "$output" | tr -d '\n' | sed 's/  */ /g')
+    fi
+
+    # Append to history file (don't fail if this doesn't work)
+    echo "$history_line" >> "$history_path" 2>/dev/null || true
+
+    $verbose && echo "Appended to history: $history_path" >&2
 
     # Also print to stdout for piping
     echo "$output"

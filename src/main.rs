@@ -1,37 +1,8 @@
-use chrono::{DateTime, Datelike, Local, Timelike, Utc};
+use chrono::{DateTime, Datelike, FixedOffset, Timelike, Utc};
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use zellij_tile::prelude::*;
-
-// --- Locale Detection ---
-
-/// Get the user's locale string from environment
-fn get_locale() -> String {
-    std::env::var("LC_TIME")
-        .or_else(|_| std::env::var("LC_ALL"))
-        .or_else(|_| std::env::var("LANG"))
-        .unwrap_or_default()
-}
-
-/// Detect if we should use US date format (MM/DD) or international (DD/MM)
-fn is_us_date_format() -> bool {
-    get_locale().starts_with("en_US")
-}
-
-/// Detect if the locale typically uses 24-hour time
-/// Most locales outside US/UK/Australia/etc use 24-hour
-fn is_24h_locale() -> bool {
-    let locale = get_locale();
-
-    // Locales that typically use 12-hour time
-    let twelve_hour_locales = [
-        "en_US", "en_AU", "en_CA", "en_NZ", "en_PH",
-        "es_US", "es_MX",
-    ];
-
-    // Check if locale starts with any 12-hour locale prefix
-    !twelve_hour_locales.iter().any(|l| locale.starts_with(l))
-}
 
 // --- Configuration ---
 
@@ -39,10 +10,10 @@ fn is_24h_locale() -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 enum ClockMode {
     #[default]
-    Auto,    // Detect from locale
-    Hour12,  // Force 12-hour
-    Hour24,  // Force 24-hour
-    Off,     // No clock
+    Auto,    // Default: 12-hour (env vars unavailable in WASM)
+    Hour12,
+    Hour24,
+    Off,
 }
 
 impl ClockMode {
@@ -56,12 +27,7 @@ impl ClockMode {
     }
 
     fn use_24h(&self) -> bool {
-        match self {
-            ClockMode::Auto => is_24h_locale(),
-            ClockMode::Hour12 => false,
-            ClockMode::Hour24 => true,
-            ClockMode::Off => false,
-        }
+        matches!(self, ClockMode::Hour24)
     }
 
     fn is_off(&self) -> bool {
@@ -75,7 +41,7 @@ enum SuffixStyle {
     #[default]
     Short,   // "a" / "p"
     Long,    // "AM" / "PM"
-    None,    // No suffix (not recommended for 12h but allowed)
+    None,
 }
 
 impl SuffixStyle {
@@ -92,7 +58,7 @@ impl SuffixStyle {
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 enum DateFormat {
     #[default]
-    Auto,  // Detect from locale
+    Auto,  // Default: US format (env vars unavailable in WASM)
     US,    // MM/DD, "Jan 27"
     Intl,  // DD/MM, "27 Jan"
     ISO,   // YYYY-MM-DD
@@ -109,12 +75,7 @@ impl DateFormat {
     }
 
     fn use_us_format(&self) -> bool {
-        match self {
-            DateFormat::Auto => is_us_date_format(),
-            DateFormat::US => true,
-            DateFormat::Intl => false,
-            DateFormat::ISO => false,
-        }
+        matches!(self, DateFormat::Auto | DateFormat::US)
     }
 
     fn is_iso(&self) -> bool {
@@ -124,37 +85,76 @@ impl DateFormat {
 
 // --- Data Structures ---
 
-/// Usage data for a single time window (5h or 7d)
+/// Usage data for a single time window
 #[derive(Debug, Clone, Default, Deserialize)]
 struct WindowUsage {
-    /// Current utilization as percentage (0-100)
     utilization: f64,
-    /// When this window resets (ISO 8601 timestamp)
     resets_at: Option<String>,
+}
+
+/// Extra usage (overages) data
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ExtraUsage {
+    is_enabled: bool,
+    monthly_limit: Option<f64>,
+    used_credits: Option<f64>,
 }
 
 /// Full usage data from claude-usage CLI
 #[derive(Debug, Clone, Default, Deserialize)]
+#[allow(dead_code)]
 struct UsageData {
-    /// When this data was fetched
     fetched_at: Option<String>,
-    /// 5-hour window usage
     five_hour: WindowUsage,
-    /// 7-day window usage
     seven_day: WindowUsage,
+    seven_day_sonnet: Option<WindowUsage>,
+    extra_usage: Option<ExtraUsage>,
 }
 
-/// Pace status based on utilization vs elapsed time
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum PaceStatus {
-    /// Utilization roughly matches elapsed time - sustainable pace
-    OnTrack,
-    /// Utilization exceeds elapsed time - will exhaust before reset
-    RunningHot,
-    /// Utilization below elapsed time - capacity going unused
-    Underutilizing,
-    /// Cannot determine (no data or invalid timestamps)
-    Unknown,
+// --- Pace Calculation ---
+// Ported from noah-statusline.js — graduated thresholds with urgency scaling
+
+/// Arrow indicating pace direction: ↑ over pace, ↓ under pace
+fn pace_arrow(utilization: f64, pace: Option<f64>) -> &'static str {
+    match pace {
+        None => "",
+        Some(p) => {
+            if utilization > p + 0.5 { "\u{2191}" }      // ↑
+            else if utilization < p - 0.5 { "\u{2193}" }  // ↓
+            else { "" }
+        }
+    }
+}
+
+/// 5h color: green at/under pace, yellow +5%, orange +10%, blinking red +15%
+fn pace_color_5h(utilization: f64, pace: Option<f64>) -> &'static str {
+    match pace {
+        None => "\x1b[32m",
+        Some(p) if utilization <= p => "\x1b[32m",
+        Some(p) => {
+            let delta = utilization - p;
+            if delta <= 5.0 { "\x1b[33m" }          // yellow
+            else if delta <= 10.0 { "\x1b[38;5;208m" } // orange
+            else { "\x1b[5;31m" }                    // blinking red
+        }
+    }
+}
+
+/// 7d color: urgency scales with remaining time via sqrt.
+/// Same delta feels worse when there's less time to correct course.
+fn pace_color_7d(utilization: f64, pace: Option<f64>) -> &'static str {
+    match pace {
+        None => "\x1b[32m",
+        Some(p) => {
+            let delta = (utilization - p).abs();
+            let remaining = ((100.0 - p) / 100.0).max(0.05);
+            let urgency = delta / remaining.sqrt();
+            if urgency <= 4.0 { "\x1b[32m" }           // green
+            else if urgency <= 10.0 { "\x1b[33m" }     // yellow
+            else if urgency <= 18.0 { "\x1b[38;5;208m" } // orange
+            else { "\x1b[5;31m" }                       // blinking red
+        }
+    }
 }
 
 // --- Display Modes ---
@@ -162,7 +162,7 @@ enum PaceStatus {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum DisplayMode {
     Hidden,   // < 18 chars
-    Minimal,  // 18-29: "5h:45% 7d:12%"
+    Minimal,  // 18-29: "5h:45%↑ 7d:12%↓"
     Compact,  // 30-44: bars
     Medium,   // 45-69: with reset times
     Full,     // 70+: with elapsed percentage
@@ -184,27 +184,48 @@ impl DisplayMode {
 
 #[derive(Default)]
 struct ClaudeBar {
-    /// Current terminal width
     cols: usize,
-    /// Theme palette from Zellij
     palette: Option<Palette>,
-    /// Usage data from file
     usage: Option<UsageData>,
-    /// Path to usage data file
     data_file: String,
-    /// Context for identifying our command results
     pending_read: bool,
+    tz_offset_secs: i32, // UTC offset from host `date +%z`, 0 = UTC fallback
 
-    // Configuration
-    /// Clock display mode (auto/12h/24h/off)
     clock_mode: ClockMode,
-    /// AM/PM suffix style (short/long/none)
     suffix_style: SuffixStyle,
-    /// Date format (auto/us/intl/iso)
     date_format: DateFormat,
 }
 
+const ANSI_RESET: &str = "\x1b[0m";
+
 impl ClaudeBar {
+    /// Get current time adjusted for host timezone offset
+    fn local_now(&self) -> DateTime<FixedOffset> {
+        let offset = FixedOffset::east_opt(self.tz_offset_secs).unwrap_or(FixedOffset::east_opt(0).unwrap());
+        Utc::now().with_timezone(&offset)
+    }
+
+    /// Request timezone offset from host
+    fn request_tz_refresh(&self) {
+        let ctx = BTreeMap::from([("source".to_string(), "tz_read".to_string())]);
+        run_command_with_env_variables_and_cwd(
+            &["/usr/bin/date", "+%z"],
+            BTreeMap::new(),
+            PathBuf::from("/tmp"),
+            ctx,
+        );
+    }
+
+    /// Parse `date +%z` output (e.g., "-0400") into seconds
+    fn parse_tz_offset(s: &str) -> Option<i32> {
+        let s = s.trim();
+        if s.len() < 5 { return None; }
+        let sign = if s.starts_with('-') { -1 } else { 1 };
+        let hours: i32 = s[1..3].parse().ok()?;
+        let mins: i32 = s[3..5].parse().ok()?;
+        Some(sign * (hours * 3600 + mins * 60))
+    }
+
     /// Calculate what percentage of the time window has elapsed
     fn calc_period_elapsed(&self, resets_at: &Option<String>, period_hours: f64) -> Option<f64> {
         let reset_str = resets_at.as_ref()?;
@@ -216,29 +237,6 @@ impl ClaudeBar {
         let elapsed_secs = period_secs - secs_until_reset;
 
         Some((elapsed_secs / period_secs * 100.0).clamp(0.0, 100.0))
-    }
-
-    /// Calculate pace status by comparing utilization to elapsed time
-    fn calc_pace_status(&self, utilization: f64, period_elapsed: Option<f64>) -> PaceStatus {
-        let elapsed = match period_elapsed {
-            Some(e) => e,
-            None => return PaceStatus::Unknown,
-        };
-
-        // If very early in period, be lenient
-        if elapsed < 5.0 {
-            return PaceStatus::OnTrack;
-        }
-
-        let ratio = utilization / elapsed;
-
-        if ratio >= 0.85 && ratio <= 1.15 {
-            PaceStatus::OnTrack
-        } else if ratio > 1.15 {
-            PaceStatus::RunningHot
-        } else {
-            PaceStatus::Underutilizing
-        }
     }
 
     /// Format duration until reset as human-readable string
@@ -273,52 +271,33 @@ impl ClaudeBar {
         }
     }
 
-    /// Get ANSI color code for a pace status
-    fn status_ansi_color(&self, status: PaceStatus) -> &'static str {
-        match status {
-            PaceStatus::OnTrack => "\x1b[32m",        // Green
-            PaceStatus::RunningHot => "\x1b[33m",    // Yellow
-            PaceStatus::Underutilizing => "\x1b[31m", // Red (wasting capacity)
-            PaceStatus::Unknown => "\x1b[37m",        // White/default
-        }
-    }
-
-    /// Reset ANSI color
-    fn ansi_reset(&self) -> &'static str {
-        "\x1b[0m"
-    }
-
-    /// Build a progress bar string
-    fn progress_bar(&self, percent: f64, width: usize, status: PaceStatus) -> String {
+    /// Build a progress bar string with a given ANSI color
+    fn progress_bar(&self, percent: f64, width: usize, color: &str) -> String {
         let filled = ((percent / 100.0) * width as f64).round() as usize;
         let filled = filled.min(width);
         let empty = width - filled;
 
-        let color = self.status_ansi_color(status);
-        let reset = self.ansi_reset();
-        let dim = "\x1b[90m"; // Dim gray for empty portion
+        let dim = "\x1b[90m";
 
-        let filled_chars: String = std::iter::repeat('█').take(filled).collect();
-        let empty_chars: String = std::iter::repeat('░').take(empty).collect();
+        let filled_chars: String = std::iter::repeat('\u{2588}').take(filled).collect();
+        let empty_chars: String = std::iter::repeat('\u{2591}').take(empty).collect();
 
-        format!("{}{}{}{}{}{}", color, filled_chars, reset, dim, empty_chars, reset)
+        format!("{}{}{}{}{}{}", color, filled_chars, ANSI_RESET, dim, empty_chars, ANSI_RESET)
     }
 
     /// Format clock based on available space and configuration
-    /// Returns (display_string, visible_length) - visible_length excludes ANSI codes
+    /// Returns (display_string, visible_length)
     fn format_clock(&self, mode: DisplayMode) -> (String, usize) {
         if self.clock_mode.is_off() {
             return ("".to_string(), 0);
         }
 
-        let now = Local::now();
+        let now = self.local_now();
         let use_24h = self.clock_mode.use_24h();
 
         let (hour_display, suffix) = if use_24h {
-            // 24-hour: no suffix needed
             (now.hour(), "".to_string())
         } else {
-            // 12-hour: convert and add suffix
             let h = now.hour() % 12;
             let hour_12 = if h == 0 { 12 } else { h };
             let is_pm = now.hour() >= 12;
@@ -333,27 +312,17 @@ impl ClaudeBar {
 
         let minute = now.minute();
         let dim = "\x1b[90m";
-        let reset = self.ansi_reset();
 
         match mode {
             DisplayMode::Hidden => ("".to_string(), 0),
 
-            DisplayMode::Minimal => {
-                // 12h: "10:43a" or 24h: "22:43"
-                let s = format!("{}:{:02}{}", hour_display, minute, suffix);
-                let len = s.len();
-                (s, len)
-            }
-
-            DisplayMode::Compact => {
-                // 12h: "10:43 AM" (or "10:43a" for short) or 24h: "22:43"
+            DisplayMode::Minimal | DisplayMode::Compact => {
                 let s = format!("{}:{:02}{}", hour_display, minute, suffix);
                 let len = s.len();
                 (s, len)
             }
 
             DisplayMode::Medium => {
-                // "10:43a 1/27" or "22:43 27/1" or "22:43 2026-01-27"
                 let date_str = if self.date_format.is_iso() {
                     format!("{}-{:02}-{:02}", now.year(), now.month(), now.day())
                 } else if self.date_format.use_us_format() {
@@ -363,14 +332,13 @@ impl ClaudeBar {
                 };
                 let s = format!(
                     "{}:{:02}{} {}{}{}",
-                    hour_display, minute, suffix, dim, date_str, reset
+                    hour_display, minute, suffix, dim, date_str, ANSI_RESET
                 );
                 let len = format!("{}:{:02}{} {}", hour_display, minute, suffix, date_str).len();
                 (s, len)
             }
 
             DisplayMode::Full => {
-                // "10:43a Wed, Jan 27" or "22:43 Wed, 27 Jan" or "22:43 2026-01-27"
                 let date_part = if self.date_format.is_iso() {
                     format!("{}-{:02}-{:02}", now.year(), now.month(), now.day())
                 } else {
@@ -400,7 +368,7 @@ impl ClaudeBar {
 
                 let s = format!(
                     "{}:{:02}{} {}{}{}",
-                    hour_display, minute, suffix, dim, date_part, reset
+                    hour_display, minute, suffix, dim, date_part, ANSI_RESET
                 );
                 let len = format!("{}:{:02}{} {}", hour_display, minute, suffix, date_part).len();
                 (s, len)
@@ -411,7 +379,45 @@ impl ClaudeBar {
     /// Request to read the usage data file
     fn request_data_refresh(&self) {
         let ctx = BTreeMap::from([("source".to_string(), "usage_read".to_string())]);
-        run_command(&["cat", &self.data_file], ctx);
+        run_command_with_env_variables_and_cwd(
+            &["/usr/bin/cat", &self.data_file],
+            BTreeMap::new(),
+            PathBuf::from("/tmp"),
+            ctx,
+        );
+    }
+
+    /// Check if currently rate-limited (any window at 100%)
+    fn is_rate_limited(&self) -> bool {
+        match &self.usage {
+            Some(u) => u.five_hour.utilization >= 100.0 || u.seven_day.utilization >= 100.0,
+            None => false,
+        }
+    }
+
+    /// Format extra usage (overages) display
+    fn format_extra_usage(&self) -> Option<(String, usize)> {
+        let usage = self.usage.as_ref()?;
+        let extra = usage.extra_usage.as_ref()?;
+
+        let monthly_limit = extra.monthly_limit.unwrap_or(0.0);
+        let used_credits = extra.used_credits.unwrap_or(0.0);
+
+        if !extra.is_enabled || monthly_limit <= 0.0 || !self.is_rate_limited() {
+            return None;
+        }
+
+        let used = used_credits / 100.0;
+        let limit = (monthly_limit / 100.0).round() as i64;
+        let color = if used_credits >= monthly_limit {
+            "\x1b[31m" // red
+        } else {
+            "\x1b[38;5;208m" // orange
+        };
+
+        let s = format!("{}\u{26a0} ${:.2}/${}{}", color, used, limit, ANSI_RESET);
+        let len = format!("\u{26a0} ${:.2}/${}", used, limit).len();
+        Some((s, len))
     }
 
     /// Build usage display string and its visible length
@@ -425,77 +431,92 @@ impl ClaudeBar {
             }
         };
 
-        // Calculate derived values
         let elapsed_5h = self.calc_period_elapsed(&usage.five_hour.resets_at, 5.0);
         let elapsed_7d = self.calc_period_elapsed(&usage.seven_day.resets_at, 168.0);
 
-        let status_5h = self.calc_pace_status(usage.five_hour.utilization, elapsed_5h);
-        let status_7d = self.calc_pace_status(usage.seven_day.utilization, elapsed_7d);
+        let util_5h = usage.five_hour.utilization;
+        let util_7d = usage.seven_day.utilization;
 
-        let color_5h = self.status_ansi_color(status_5h);
-        let color_7d = self.status_ansi_color(status_7d);
-        let reset = self.ansi_reset();
+        let color_5h = pace_color_5h(util_5h, elapsed_5h);
+        let color_7d = pace_color_7d(util_7d, elapsed_7d);
+        let arrow_5h = pace_arrow(util_5h, elapsed_5h);
+        let arrow_7d = pace_arrow(util_7d, elapsed_7d);
 
         match mode {
             DisplayMode::Hidden => ("".to_string(), 0),
 
             DisplayMode::Minimal => {
-                // "5h:45% 7d:12%"
+                // "5h:45%↑ 7d:12%↓"
                 let s = format!(
-                    "{}5h:{:.0}%{} {}7d:{:.0}%{}",
-                    color_5h, usage.five_hour.utilization, reset,
-                    color_7d, usage.seven_day.utilization, reset
+                    "{}5h:{:.0}%{}{} {}7d:{:.0}%{}{}",
+                    color_5h, util_5h, arrow_5h, ANSI_RESET,
+                    color_7d, util_7d, arrow_7d, ANSI_RESET
                 );
                 let len = format!(
-                    "5h:{:.0}% 7d:{:.0}%",
-                    usage.five_hour.utilization, usage.seven_day.utilization
+                    "5h:{:.0}%{} 7d:{:.0}%{}",
+                    util_5h, arrow_5h, util_7d, arrow_7d
                 ).len();
                 (s, len)
             }
 
             DisplayMode::Compact => {
                 // "5h ████░░░░ 7d █░░░░░░░"
-                let bar_5h = self.progress_bar(usage.five_hour.utilization, 6, status_5h);
-                let bar_7d = self.progress_bar(usage.seven_day.utilization, 6, status_7d);
+                let bar_5h = self.progress_bar(util_5h, 6, color_5h);
+                let bar_7d = self.progress_bar(util_7d, 6, color_7d);
                 let s = format!("5h {} 7d {}", bar_5h, bar_7d);
-                // Visible: "5h ██████ 7d ██████" = 3 + 6 + 4 + 6 = 19
-                let len = 3 + 6 + 4 + 6;
+                let len = 3 + 6 + 4 + 6; // "5h ██████ 7d ██████"
                 (s, len)
             }
 
             DisplayMode::Medium => {
-                // "5h: 45% (2h30m) │ 7d: 12% (4d)"
+                // "5h: 45%↑ (2h30m) │ 7d: 12%↓ (4d)"
                 let time_5h = self.format_time_until(&usage.five_hour.resets_at);
                 let time_7d = self.format_time_until(&usage.seven_day.resets_at);
-                let s = format!(
-                    "5h: {}{:.0}%{} ({}) │ 7d: {}{:.0}%{} ({})",
-                    color_5h, usage.five_hour.utilization, reset, time_5h,
-                    color_7d, usage.seven_day.utilization, reset, time_7d
+
+                let mut s = format!(
+                    "5h: {}{:.0}%{}{} ({}) \u{2502} 7d: {}{:.0}%{}{} ({})",
+                    color_5h, util_5h, arrow_5h, ANSI_RESET, time_5h,
+                    color_7d, util_7d, arrow_7d, ANSI_RESET, time_7d
                 );
-                let len = format!(
-                    "5h: {:.0}% ({}) │ 7d: {:.0}% ({})",
-                    usage.five_hour.utilization, time_5h,
-                    usage.seven_day.utilization, time_7d
+                let mut len = format!(
+                    "5h: {:.0}%{} ({}) \u{2502} 7d: {:.0}%{} ({})",
+                    util_5h, arrow_5h, time_5h,
+                    util_7d, arrow_7d, time_7d
                 ).len();
+
+                // Append extra usage if rate-limited
+                if let Some((extra_s, extra_len)) = self.format_extra_usage() {
+                    s = format!("{} \u{2502} {}", s, extra_s);
+                    len += 3 + extra_len; // " │ " + extra
+                }
+
                 (s, len)
             }
 
             DisplayMode::Full => {
-                // "5h: 45% (50% elapsed) 2h30m │ 7d: 12% (14% elapsed) 4d"
+                // "5h: 45%↑ (50% elapsed) 2h30m │ 7d: 12%↓ (14% elapsed) 4d"
                 let time_5h = self.format_time_until(&usage.five_hour.resets_at);
                 let time_7d = self.format_time_until(&usage.seven_day.resets_at);
                 let elapsed_5h_str = elapsed_5h.map(|e| format!("{:.0}%", e)).unwrap_or("?".to_string());
                 let elapsed_7d_str = elapsed_7d.map(|e| format!("{:.0}%", e)).unwrap_or("?".to_string());
-                let s = format!(
-                    "5h: {}{:.0}%{} ({} elapsed) {} │ 7d: {}{:.0}%{} ({} elapsed) {}",
-                    color_5h, usage.five_hour.utilization, reset, elapsed_5h_str, time_5h,
-                    color_7d, usage.seven_day.utilization, reset, elapsed_7d_str, time_7d
+
+                let mut s = format!(
+                    "5h: {}{:.0}%{}{} ({} elapsed) {} \u{2502} 7d: {}{:.0}%{}{} ({} elapsed) {}",
+                    color_5h, util_5h, arrow_5h, ANSI_RESET, elapsed_5h_str, time_5h,
+                    color_7d, util_7d, arrow_7d, ANSI_RESET, elapsed_7d_str, time_7d
                 );
-                let len = format!(
-                    "5h: {:.0}% ({} elapsed) {} │ 7d: {:.0}% ({} elapsed) {}",
-                    usage.five_hour.utilization, elapsed_5h_str, time_5h,
-                    usage.seven_day.utilization, elapsed_7d_str, time_7d
+                let mut len = format!(
+                    "5h: {:.0}%{} ({} elapsed) {} \u{2502} 7d: {:.0}%{} ({} elapsed) {}",
+                    util_5h, arrow_5h, elapsed_5h_str, time_5h,
+                    util_7d, arrow_7d, elapsed_7d_str, time_7d
                 ).len();
+
+                // Append extra usage if rate-limited
+                if let Some((extra_s, extra_len)) = self.format_extra_usage() {
+                    s = format!("{} \u{2502} {}", s, extra_s);
+                    len += 3 + extra_len;
+                }
+
                 (s, len)
             }
         }
@@ -507,7 +528,7 @@ impl ClaudeBar {
             return ("".to_string(), 0);
         }
 
-        let now = Local::now();
+        let now = self.local_now();
         let use_24h = self.clock_mode.use_24h();
 
         let hour = if use_24h {
@@ -527,7 +548,6 @@ impl ClaudeBar {
         let mode = DisplayMode::from_width(cols);
 
         if mode == DisplayMode::Hidden {
-            // Even when hidden, show just the time if we have any space
             if cols >= 6 && !self.clock_mode.is_off() {
                 let (mini_clock, _) = self.format_mini_clock();
                 print!(" {}", mini_clock);
@@ -538,30 +558,24 @@ impl ClaudeBar {
         let (usage_str, usage_len) = self.format_usage(mode);
         let (clock_str, clock_len) = self.format_clock(mode);
 
-        // If clock is off, just show usage
         if self.clock_mode.is_off() {
             print!(" {}", usage_str);
             return;
         }
 
-        // Layout: " {usage} ... {clock} "
-        // We need 1 char padding on each side, plus at least 1 space between
         let content_width = usage_len + clock_len;
-        let available = cols.saturating_sub(3); // 2 edge padding + 1 min separator
+        let available = cols.saturating_sub(3);
 
         if content_width <= available {
-            // Both fit - add padding between
             let padding = cols.saturating_sub(usage_len + clock_len + 2);
             let spaces: String = std::iter::repeat(' ').take(padding).collect();
             print!(" {}{}{} ", usage_str, spaces, clock_str);
         } else if usage_len + 7 <= cols {
-            // Clock doesn't fit at full size, show minimal time on right
             let (mini_clock, mini_len) = self.format_mini_clock();
             let padding = cols.saturating_sub(usage_len + mini_len + 2);
             let spaces: String = std::iter::repeat(' ').take(padding).collect();
             print!(" {}{}{} ", usage_str, spaces, mini_clock);
         } else {
-            // Only usage fits
             print!(" {}", usage_str);
         }
     }
@@ -569,13 +583,11 @@ impl ClaudeBar {
 
 impl ZellijPlugin for ClaudeBar {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
-        // Request permissions
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::RunCommands,
         ]);
 
-        // Subscribe to events
         subscribe(&[
             EventType::Timer,
             EventType::ModeUpdate,
@@ -583,12 +595,10 @@ impl ZellijPlugin for ClaudeBar {
             EventType::RunCommandResult,
         ]);
 
-        // Determine data file path
-        self.data_file = configuration
+        let raw_path = configuration
             .get("data_file")
             .cloned()
             .unwrap_or_else(|| {
-                // Default path matching claude-usage CLI output
                 if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
                     format!("{}/claude-usage/usage.json", state_home)
                 } else if let Ok(home) = std::env::var("HOME") {
@@ -597,41 +607,44 @@ impl ZellijPlugin for ClaudeBar {
                     "/tmp/claude-usage.json".to_string()
                 }
             });
+        // Expand ~ since run_command doesn't go through a shell
+        self.data_file = if raw_path.starts_with("~/") {
+            if let Ok(home) = std::env::var("HOME") {
+                format!("{}{}", home, &raw_path[1..])
+            } else {
+                raw_path
+            }
+        } else {
+            raw_path
+        };
 
-        // Parse clock configuration
-        // clock = "auto" | "12h" | "24h" | "off"
         self.clock_mode = configuration
             .get("clock")
             .map(|s| ClockMode::from_str(s))
             .unwrap_or_default();
 
-        // suffix = "short" | "long" | "none" (only applies to 12h mode)
         self.suffix_style = configuration
             .get("suffix")
             .map(|s| SuffixStyle::from_str(s))
             .unwrap_or_default();
 
-        // date_format = "auto" | "us" | "intl" | "iso"
         self.date_format = configuration
             .get("date_format")
             .map(|s| DateFormat::from_str(s))
             .unwrap_or_default();
 
-        // Set up refresh timer (every 60 seconds - file updates every 5 min via cron)
-        set_timeout(1.0); // Initial read after 1 second
+        set_timeout(1.0);
 
-        // Request initial data read
         self.pending_read = true;
-        self.request_data_refresh();
     }
 
     fn update(&mut self, event: Event) -> bool {
         match event {
             Event::Timer(_) => {
-                // Refresh data periodically
-                set_timeout(60.0);
+                set_timeout(10.0);
                 self.request_data_refresh();
-                true // Re-render for clock/time updates
+                self.request_tz_refresh(); // re-fetch for DST changes
+                true
             }
 
             Event::ModeUpdate(mode_info) => {
@@ -640,25 +653,39 @@ impl ZellijPlugin for ClaudeBar {
             }
 
             Event::PermissionRequestResult(_) => {
-                // Re-request data read once permissions granted
-                if self.pending_read {
-                    self.request_data_refresh();
-                }
-                false
+                self.request_data_refresh();
+                self.request_tz_refresh();
+                self.pending_read = false;
+                true
             }
 
             Event::RunCommandResult(exit_code, stdout, _stderr, context) => {
-                // Check if this is our usage read
-                if context.get("source").map(|s| s.as_str()) == Some("usage_read") {
-                    self.pending_read = false;
-                    if exit_code == Some(0) {
-                        if let Ok(data) = serde_json::from_slice::<UsageData>(&stdout) {
-                            self.usage = Some(data);
-                            return true;
+                match context.get("source").map(|s| s.as_str()) {
+                    Some("usage_read") => {
+                        self.pending_read = false;
+                        if exit_code == Some(0) {
+                            if let Ok(data) = serde_json::from_slice::<UsageData>(&stdout) {
+                                self.usage = Some(data);
+                                return true;
+                            }
                         }
+                        false
                     }
+                    Some("tz_read") => {
+                        if exit_code == Some(0) {
+                            if let Ok(s) = String::from_utf8(stdout) {
+                                if let Some(offset) = Self::parse_tz_offset(&s) {
+                                    if offset != self.tz_offset_secs {
+                                        self.tz_offset_secs = offset;
+                                        return true; // re-render with new offset
+                                    }
+                                }
+                            }
+                        }
+                        false
+                    }
+                    _ => false,
                 }
-                false
             }
 
             _ => false,

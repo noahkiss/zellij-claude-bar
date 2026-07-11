@@ -10,6 +10,10 @@
 #   - JSON file with utilization data for zellij-claude-bar plugin
 #   - History log (JSONL) for later analysis
 
+# Ensure PATH includes linuxbrew for cron compatibility
+PATH="/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:$PATH"
+export PATH
+
 set -e
 
 # --- Configuration ---
@@ -193,53 +197,47 @@ main() {
         exit 1
     }
 
-    # Parse response
-    local five_hour_util five_hour_reset seven_day_util seven_day_reset
-    five_hour_util=$(json_extract "$response" "five_hour.utilization")
-    five_hour_reset=$(json_extract "$response" "five_hour.resets_at")
-    seven_day_util=$(json_extract "$response" "seven_day.utilization")
-    seven_day_reset=$(json_extract "$response" "seven_day.resets_at")
-
-    # Validate we got data
-    if [ -z "$five_hour_util" ] && [ -z "$seven_day_util" ]; then
-        $verbose && echo "Error: Could not parse usage data from response" >&2
-        $verbose && echo "Response: $response" >&2
+    # Check for API error responses (e.g. token expiry)
+    if $HAS_JQ && echo "$response" | jq -e '.type == "error"' >/dev/null 2>&1; then
+        local err_msg
+        err_msg=$(echo "$response" | jq -r '.error.message // "unknown error"' 2>/dev/null)
+        $verbose && echo "Error: API returned error: $err_msg" >&2
         exit 1
     fi
-
-    # Default to 0 if missing
-    : "${five_hour_util:=0}"
-    : "${seven_day_util:=0}"
-    : "${five_hour_reset:=null}"
-    : "${seven_day_reset:=null}"
 
     # Get current timestamp
     local now
     now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-    # Build output JSON
+    # Build output JSON — pass through full API response with fetched_at added
     local output
     if $HAS_JQ; then
-        # Use jq for proper JSON formatting
-        output=$(jq -n \
-            --arg ts "$now" \
-            --argjson fh_util "$five_hour_util" \
-            --arg fh_reset "$five_hour_reset" \
-            --argjson sd_util "$seven_day_util" \
-            --arg sd_reset "$seven_day_reset" \
-            '{
-                fetched_at: $ts,
-                five_hour: {
-                    utilization: $fh_util,
-                    resets_at: $fh_reset
-                },
-                seven_day: {
-                    utilization: $sd_util,
-                    resets_at: $sd_reset
-                }
-            }')
+        # Validate response is JSON and pass through all fields
+        output=$(echo "$response" | jq --arg ts "$now" '. + {fetched_at: $ts}' 2>/dev/null)
+        if [ -z "$output" ]; then
+            $verbose && echo "Error: Invalid JSON response from API" >&2
+            $verbose && echo "Response: $response" >&2
+            exit 1
+        fi
     else
-        # Manual JSON construction
+        # Fallback: extract core fields manually (no jq)
+        local five_hour_util five_hour_reset seven_day_util seven_day_reset
+        five_hour_util=$(json_extract "$response" "five_hour.utilization")
+        five_hour_reset=$(json_extract "$response" "five_hour.resets_at")
+        seven_day_util=$(json_extract "$response" "seven_day.utilization")
+        seven_day_reset=$(json_extract "$response" "seven_day.resets_at")
+
+        if [ -z "$five_hour_util" ] && [ -z "$seven_day_util" ]; then
+            $verbose && echo "Error: Could not parse usage data from response" >&2
+            $verbose && echo "Response: $response" >&2
+            exit 1
+        fi
+
+        : "${five_hour_util:=0}"
+        : "${seven_day_util:=0}"
+        : "${five_hour_reset:=null}"
+        : "${seven_day_reset:=null}"
+
         output=$(cat <<EOF
 {
   "fetched_at": "$now",

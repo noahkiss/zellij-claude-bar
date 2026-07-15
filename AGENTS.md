@@ -233,7 +233,7 @@ Fix: use `run_command_with_env_variables_and_cwd` with `PathBuf::from("/tmp")`. 
 use std::path::PathBuf;
 
 run_command_with_env_variables_and_cwd(
-    &["/usr/bin/cat", &self.data_file],
+    &["/bin/cat", &self.data_file],
     BTreeMap::new(),
     PathBuf::from("/tmp"),
     context,
@@ -254,7 +254,7 @@ Plugins run in a WASI sandbox. Key restrictions:
 
 ### Permissions
 
-Permissions are cached in `~/Library/Caches/zellij/permissions.kdl` (Linux: may vary, check `ZELLIJ_CACHE_DIR`). Format:
+Permissions are cached in `~/Library/Caches/org.Zellij-Contributors.Zellij/permissions.kdl` on macOS (Linux: may vary, check `ZELLIJ_CACHE_DIR`). Format:
 ```kdl
 "/path/to/plugin.wasm" {
     RunCommands

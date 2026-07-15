@@ -209,7 +209,7 @@ impl ClaudeBar {
     fn request_tz_refresh(&self) {
         let ctx = BTreeMap::from([("source".to_string(), "tz_read".to_string())]);
         run_command_with_env_variables_and_cwd(
-            &["/usr/bin/date", "+%z"],
+            &["/bin/date", "+%z"],
             BTreeMap::new(),
             PathBuf::from("/tmp"),
             ctx,
@@ -380,7 +380,7 @@ impl ClaudeBar {
     fn request_data_refresh(&self) {
         let ctx = BTreeMap::from([("source".to_string(), "usage_read".to_string())]);
         run_command_with_env_variables_and_cwd(
-            &["/usr/bin/cat", &self.data_file],
+            &["/bin/cat", &self.data_file],
             BTreeMap::new(),
             PathBuf::from("/tmp"),
             ctx,

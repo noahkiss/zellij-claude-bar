@@ -100,7 +100,18 @@ struct ExtraUsage {
     used_credits: Option<f64>,
 }
 
-/// Full usage data from claude-usage CLI
+/// Full usage data read from `usage.json` (path = `data_file` config).
+///
+/// Whatever writes that file is the source of truth — this plugin only reads it. Two common
+/// producers: (a) the bundled `bin/claude-usage` CLI on a cron (see AGENTS.md), or (b) a
+/// statusline that mirrors the host's rate-limit payload plus a small OAuth poller. Either way
+/// the FIELDS split by origin:
+///   • five_hour / seven_day — the all-model windows; always present.
+///   • seven_day_sonnet / fable — per-model weekly buckets that exist ONLY on Anthropic's
+///     `/api/oauth/usage` endpoint (never in a stdin/statusline payload). They're `Option`
+///     because they're null/absent until that model is used in-window; the bar simply omits
+///     the S:/F: segment when they're missing.
+///   • extra_usage — overage credits, only meaningful when rate-limited.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[allow(dead_code)]
 struct UsageData {
@@ -108,6 +119,7 @@ struct UsageData {
     five_hour: WindowUsage,
     seven_day: WindowUsage,
     seven_day_sonnet: Option<WindowUsage>,
+    fable: Option<WindowUsage>,
     extra_usage: Option<ExtraUsage>,
 }
 
@@ -140,19 +152,34 @@ fn pace_color_5h(utilization: f64, pace: Option<f64>) -> &'static str {
     }
 }
 
-/// 7d color: urgency scales with remaining time via sqrt.
-/// Same delta feels worse when there's less time to correct course.
+/// 7d color: DIRECTIONAL. The weekly budget is a use-it-or-lose-it pool on a fixed reset,
+/// so the win is spending it evenly — the two directions mean opposite things and get
+/// opposite color languages so a glance tells you which way you're off:
+///   OVER pace  → warm (yellow → orange → blinking red): burning too fast, ease off.
+///   UNDER pace → pastel cool (pink → violet): headroom going to waste, you can lean in.
+/// Pastels are light-value so they stay legible on the dark theme (saturated purple reads
+/// as mud). Urgency scales via sqrt(remaining): the same drift matters more as the window
+/// closes — less time to correct an overspend, or to spend a surplus.
 fn pace_color_7d(utilization: f64, pace: Option<f64>) -> &'static str {
     match pace {
         None => "\x1b[32m",
         Some(p) => {
-            let delta = (utilization - p).abs();
+            let signed = utilization - p; // + = over budget, − = under budget
             let remaining = ((100.0 - p) / 100.0).max(0.05);
-            let urgency = delta / remaining.sqrt();
-            if urgency <= 4.0 { "\x1b[32m" }           // green
-            else if urgency <= 10.0 { "\x1b[33m" }     // yellow
-            else if urgency <= 18.0 { "\x1b[38;5;208m" } // orange
-            else { "\x1b[5;31m" }                       // blinking red
+            let urgency = signed.abs() / remaining.sqrt();
+            if urgency <= 4.0 {
+                "\x1b[32m" // green — on pace (either direction)
+            } else if signed > 0.0 {
+                // OVER — spending too fast
+                if urgency <= 10.0 { "\x1b[33m" }        // yellow — drifting over
+                else if urgency <= 18.0 { "\x1b[38;5;208m" } // orange — needs correction
+                else { "\x1b[5;31m" }                    // blinking red — well over
+            } else {
+                // UNDER — leaving budget on the table
+                if urgency <= 10.0 { "\x1b[38;5;218m" }  // pastel pink — a little headroom
+                else if urgency <= 18.0 { "\x1b[38;5;183m" } // pastel violet — lots of headroom
+                else { "\x1b[1;38;5;183m" }              // bold pastel violet — way under
+            }
         }
     }
 }
@@ -420,6 +447,36 @@ impl ClaudeBar {
         Some((s, len))
     }
 
+    /// Per-model weekly segments (Sonnet + Fable), appended after 5h/7d in the wider modes.
+    /// Gated on presence: seven_day_sonnet is null until Sonnet is used in-window; fable
+    /// only appears when the API reports it. Both share the 7d weekly reset, so there's no
+    /// per-segment timer (it would duplicate 7d's) — just a labeled, pace-colored %↕. The %
+    /// uses the same directional 7d pace coloring as 7d; only the label is tinted, to tell
+    /// the models apart (S: dim, F: blue — legible on the dark theme).
+    fn format_per_model(&self) -> (String, usize) {
+        let usage = match &self.usage {
+            Some(u) => u,
+            None => return (String::new(), 0),
+        };
+        let mut s = String::new();
+        let mut len = 0usize;
+        let mut seg = |label: &str, label_color: &str, w: &Option<WindowUsage>| {
+            if let Some(w) = w {
+                let elapsed = self.calc_period_elapsed(&w.resets_at, 168.0);
+                let color = pace_color_7d(w.utilization, elapsed);
+                let arrow = pace_arrow(w.utilization, elapsed);
+                s += &format!(
+                    " \u{2502} {}{}:{}{}{:.0}%{}{}",
+                    label_color, label, ANSI_RESET, color, w.utilization, arrow, ANSI_RESET
+                );
+                len += format!(" \u{2502} {}:{:.0}%{}", label, w.utilization, arrow).len();
+            }
+        };
+        seg("S", "\x1b[90m", &usage.seven_day_sonnet);   // Sonnet — dim label
+        seg("F", "\x1b[38;5;117m", &usage.fable);        // Fable — blue label
+        (s, len)
+    }
+
     /// Build usage display string and its visible length
     fn format_usage(&self, mode: DisplayMode) -> (String, usize) {
         let usage = match &self.usage {
@@ -484,6 +541,11 @@ impl ClaudeBar {
                     util_7d, arrow_7d, time_7d
                 ).len();
 
+                // Per-model weekly segments (Sonnet + Fable) when present
+                let (pm_s, pm_len) = self.format_per_model();
+                s.push_str(&pm_s);
+                len += pm_len;
+
                 // Append extra usage if rate-limited
                 if let Some((extra_s, extra_len)) = self.format_extra_usage() {
                     s = format!("{} \u{2502} {}", s, extra_s);
@@ -510,6 +572,11 @@ impl ClaudeBar {
                     util_5h, arrow_5h, elapsed_5h_str, time_5h,
                     util_7d, arrow_7d, elapsed_7d_str, time_7d
                 ).len();
+
+                // Per-model weekly segments (Sonnet + Fable) when present
+                let (pm_s, pm_len) = self.format_per_model();
+                s.push_str(&pm_s);
+                len += pm_len;
 
                 // Append extra usage if rate-limited
                 if let Some((extra_s, extra_len)) = self.format_extra_usage() {

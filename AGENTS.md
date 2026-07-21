@@ -67,6 +67,10 @@ A POSIX shell script that:
     "utilization": 2.0,
     "resets_at": "2026-01-29T15:59:59.819305+00:00"
   },
+  "fable": {
+    "utilization": 10.0,
+    "resets_at": "2026-01-29T15:59:59.819305+00:00"
+  },
   "extra_usage": {
     "is_enabled": true,
     "monthly_limit": 4000,
@@ -122,15 +126,21 @@ Graduated color thresholds ported from noah-statusline.js:
 | +10% | Orange | Over pace |
 | +15% | Blinking red | Well over |
 
-### 7-day window
-Urgency scales with remaining time via `sqrt(remaining)` — same delta feels worse when there's less time to correct course.
+### 7-day window (directional)
+Urgency scales with remaining time via `sqrt(remaining)` — the same drift matters more as the window closes. The weekly pool is use-it-or-lose-it, so **over** and **under** pace mean opposite things and get opposite color languages: warm = burning too fast (ease off), pastel cool = headroom going to waste (lean in). Pastels are light-value so they stay legible on dark themes.
 
-| Urgency score | Color | Meaning |
-|--------------|-------|---------|
-| ≤ 4 | Green | On track |
-| ≤ 10 | Yellow | Drifting |
-| ≤ 18 | Orange | Needs correction |
-| > 18 | Blinking red | Off track |
+| Direction | Urgency score | Color | Meaning |
+|-----------|--------------|-------|---------|
+| either | ≤ 4 | Green | On pace |
+| over | ≤ 10 | Yellow | Drifting over |
+| over | ≤ 18 | Orange | Needs correction |
+| over | > 18 | Blinking red | Well over |
+| under | ≤ 10 | Pastel pink | A little headroom |
+| under | ≤ 18 | Pastel violet | Lots of headroom |
+| under | > 18 | Bold pastel violet | Way under — use it or lose it |
+
+### Per-model segments (Sonnet + Fable)
+When `seven_day_sonnet` / `fable` are present in `usage.json`, medium/full modes append labeled, pace-colored segments: `│ S:23%↓ │ F:11%↓`. Both share the 7d weekly reset (no separate timer). The `%` uses the directional 7d coloring above; only the label is tinted (`S:` dim, `F:` blue) to tell the models apart. Absent/null fields render nothing.
 
 ### Pace arrows
 - ↑ shown when utilization exceeds period elapsed (over pace)
